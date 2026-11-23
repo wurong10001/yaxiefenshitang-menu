@@ -472,6 +472,8 @@ function renderAdminPage(): string {
   }
   .dropzone.dragover { border-color: var(--accent); background: var(--accent-soft, rgba(199,62,58,.06)); }
   .dz-img { max-width: 100%; max-height: 200px; border-radius: 10px; display: none; }
+  /* 文件输入：手机浏览器无法唤起 hidden 元素的 .click()，用离屏隐藏保证可选图 */
+  #dzFile { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); opacity: 0; }
   .dz-ph { display: block; }
 
   .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
@@ -521,7 +523,8 @@ function renderAdminPage(): string {
       <span class="dz-ph" id="dzPh">拖入菜品图片，或点击选择（选填）</span>
       <img class="dz-img" id="dzImg" alt="" />
     </div>
-    <input type="file" id="dzFile" accept="image/*" hidden />
+    <input type="file" id="dzFile" accept="image/*" />
+    <div class="field" style="margin-top:12px"><label>图片链接</label><input id="i-image-url" type="text" placeholder="或粘贴图片 URL（选填，直接存为图片源）" /></div>
     <div style="height:12px"></div>
     <div class="field"><label class="req">菜名</label><input id="i-name" type="text" placeholder="如：秘制红烧肉" /></div>
     <div class="field"><label class="req">价格</label><input id="i-price" type="number" min="0" step="0.5" placeholder="如：58" /></div>
@@ -726,9 +729,9 @@ function addItem() {
     price: price,
     desc: $("i-desc").value.trim(),
     tag: $("i-tag").value.trim(),
-    image: draftImage || "",
+    image: draftImage || $("i-image-url").value.trim() || "",
   });
-  $("i-name").value = ""; $("i-price").value = ""; $("i-desc").value = ""; $("i-tag").value = "";
+  $("i-name").value = ""; $("i-price").value = ""; $("i-desc").value = ""; $("i-tag").value = ""; $("i-image-url").value = "";
   resetDraft();
   renderCategories();
   setStatus("addStatus", "已添加「" + name + "」到「" + state.categories[ci].name + "」顶部", true);
