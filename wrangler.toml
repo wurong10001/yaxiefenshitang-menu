@@ -1,0 +1,12 @@
+# Cloudflare Workers 配置 —— 云间小馆菜单
+# name：部署的 Worker 名称（Cloudflare 上同名）
+name = "menu-worker"
+main = "src/index.ts"
+compatibility_date = "2025-06-01"
+
+# KV 命名空间绑定：菜单分类数据存于 KV，键格式为 menu:<category-id>
+# id 为命名空间 yaxiefenshitang-menu 的实际 ID，name 用于可读性。
+[[kv_namespaces]]
+binding = "MENU_KV"
+id = "921e0e9a45db4c20a7ca1dd149579a68"
+name = "yaxiefenshitang-menu"

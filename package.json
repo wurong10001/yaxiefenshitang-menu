@@ -1,0 +1,19 @@
+{
+  "name": "menu-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "云间小馆 · 饭店菜单，Cloudflare Workers + KV 驱动",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy --minify",
+    "kv:create": "wrangler kv namespace create yaxiefenshitang-menu --name yaxiefenshitang-menu",
+    "kv:sync": "node scripts/sync-kv.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261119.1",
+    "typescript": "^5.5.4",
+    "wrangler": "^4.32.0"
+  }
+}

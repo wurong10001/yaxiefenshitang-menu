@@ -1,0 +1,49 @@
+name: Deploy to Cloudflare
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # 支持在 Actions 页面手动触发
+
+jobs:
+  deploy:
+    name: Deploy Worker + Sync KV
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Deploy Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npm run deploy
+
+      - name: Sync menu data to KV
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          KV_NAMESPACE_ID: ${{ vars.KV_NAMESPACE_ID || '921e0e9a45db4c20a7ca1dd149579a68' }}
+        run: npm run kv:sync
+
+      - name: Health check
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+        run: |
+          URL="${WORKER_URL:-https://menu-worker.<your-subdomain>.workers.dev}"
+          echo "等待部署生效…"
+          sleep 10
+          curl -fsS "$URL/health" || echo "::warning::健康检查未通过，请稍后手动访问 $URL"
