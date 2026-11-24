@@ -2,6 +2,21 @@ import menuData from "../data/menu.json";
 
 /** KV 键前缀：每个菜单分类存一个键，如 menu:signature */
 const MENU_KEY_PREFIX = "menu:";
+/** 购物车规则配置的 KV 键 */
+const CONFIG_KEY = `${MENU_KEY_PREFIX}config`;
+/** 默认分类归类映射（KV 未配置 config 时的兜底：按分类名/id 关键词推断） */
+function inferGroups(categories: MenuCategory[]): Record<string, FoodGroup> {
+  const map: Record<string, FoodGroup> = {};
+  for (const cat of categories) {
+    const s = (cat.id + " " + cat.name).toLowerCase();
+    map[cat.id] = /drink|beverage|饮料|饮品/.test(s)
+      ? "饮料"
+      : /staple|主食|饭|面|粉/.test(s)
+      ? "主食"
+      : "小吃";
+  }
+  return map;
+}
 
 export interface MenuItem {
   name: string;
@@ -18,9 +33,32 @@ export interface MenuCategory {
   items: MenuItem[];
 }
 
+/** 规格配置：口味单选 + 份量单选（份量决定价格） */
+export interface SpecConfig {
+  flavors: string[];
+  portions: Array<{ name: string; price: number }>;
+}
+
+/** 加料配置：可加到某道主食上，单独归类、单独加价，并生成备注模板 */
+export interface AddonConfig {
+  name: string;          // 加料显示名，如 煎蛋
+  price: number;         // 加价
+  group: FoodGroup;      // 加料归类，如 小吃
+  noteTemplate: string;  // 备注模板，{addon} 与 {base} 分别替换为加料名与主菜名
+}
+
+/** 全部购物车相关的可配置规则，存于 KV 键 menu:config */
+export interface MenuConfig {
+  /** 分类 ID → 归类维度。菜品归类直接由其所在分类决定 */
+  categoryGroups: Record<string, FoodGroup>;
+  specs: Record<string, SpecConfig>;            // 菜名（精确）→ 规格
+  addonsFor: Record<string, AddonConfig[]>;    // 主菜名（精确）→ 可加料列表
+}
+
 export interface MenuData {
   restaurant: { name: string; tagline: string; notice?: string };
   categories: MenuCategory[];
+  config?: MenuConfig;
 }
 
 /** 购物车导出时的归类维度 */
@@ -91,10 +129,25 @@ async function loadMenu(env: Env): Promise<MenuData> {
     // 餐厅信息键缺失或损坏时使用默认值
   }
 
-  // 分类键（排除餐厅信息键）
+  // 购物车规则配置（原始读取，下面结合分类做兜底）
+  let rawConfig: MenuConfig | null = null;
+  try {
+    const c = await env.MENU_KV.get<MenuConfig>(CONFIG_KEY, "json");
+    if (c && c.categoryGroups && typeof c.categoryGroups === "object") {
+      rawConfig = {
+        categoryGroups: c.categoryGroups,
+        specs: c.specs && typeof c.specs === "object" ? c.specs : {},
+        addonsFor: c.addonsFor && typeof c.addonsFor === "object" ? c.addonsFor : {},
+      };
+    }
+  } catch {
+    // 配置键缺失或损坏时走兜底
+  }
+
+  // 分类键（排除餐厅信息键与配置键）
   const catKeys = keys
     .map((k) => k.name)
-    .filter((name) => name !== `${MENU_KEY_PREFIX}restaurant`)
+    .filter((name) => name !== `${MENU_KEY_PREFIX}restaurant` && name !== CONFIG_KEY)
     .sort();
   const categories: MenuCategory[] = [];
   for (const name of catKeys) {
@@ -107,7 +160,13 @@ async function loadMenu(env: Env): Promise<MenuData> {
       // 单个键读取失败时跳过，不影响整体渲染
     }
   }
-  return categories.length > 0 ? { restaurant, categories } : menuData;
+  if (categories.length === 0) return menuData;
+  const config: MenuConfig = rawConfig || {
+    categoryGroups: inferGroups(categories),
+    specs: {},
+    addonsFor: {},
+  };
+  return { restaurant, categories, config };
 }
 
 /** 将完整菜单写入 KV：写入餐厅信息与各分类，并清理已删除的键 */
@@ -125,8 +184,12 @@ async function saveMenu(env: Env, menu: MenuData): Promise<void> {
   for (const { key, value } of entries) {
     await env.MENU_KV.put(key, value);
   }
+  // 写入购物车规则配置
+  if (menu.config) {
+    await env.MENU_KV.put(CONFIG_KEY, JSON.stringify(menu.config));
+  }
   const { keys } = await env.MENU_KV.list({ prefix: MENU_KEY_PREFIX });
-  const keep = new Set([restaurantKey, ...entries.map((e) => e.key)]);
+  const keep = new Set([restaurantKey, CONFIG_KEY, ...entries.map((e) => e.key)]);
   for (const { name } of keys) {
     if (!keep.has(name)) {
       await env.MENU_KV.delete(name);
@@ -176,47 +239,67 @@ function normalizeMenu(raw: unknown): MenuData | null {
           : undefined,
     },
     categories,
+    config: normalizeConfig(input.config),
   };
+}
+
+/** 规范化购物车配置：只接受结构合法的字段，避免脏数据写入 KV */
+function normalizeConfig(raw: unknown): MenuConfig | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const c = raw as Partial<MenuConfig>;
+  const categoryGroups: Record<string, FoodGroup> = {};
+  if (c.categoryGroups && typeof c.categoryGroups === "object") {
+    for (const [id, g] of Object.entries(c.categoryGroups)) {
+      if (g === "主食" || g === "小吃" || g === "饮料") categoryGroups[id] = g;
+    }
+  }
+  const specs: Record<string, SpecConfig> = {};
+  if (c.specs && typeof c.specs === "object") {
+    for (const [name, s] of Object.entries(c.specs)) {
+      if (
+        s && Array.isArray(s.flavors) && s.flavors.every((f) => typeof f === "string") &&
+        Array.isArray(s.portions) &&
+        s.portions.every(
+          (p) => p && typeof p.name === "string" && Number.isFinite(Number(p.price))
+        )
+      ) {
+        specs[name] = {
+          flavors: s.flavors,
+          portions: s.portions.map((p) => ({ name: p.name, price: Number(p.price) })),
+        };
+      }
+    }
+  }
+  const addonsFor: Record<string, AddonConfig[]> = {};
+  if (c.addonsFor && typeof c.addonsFor === "object") {
+    for (const [name, list] of Object.entries(c.addonsFor)) {
+      if (!Array.isArray(list)) continue;
+      addonsFor[name] = list
+        .filter(
+          (a): a is AddonConfig =>
+            !!a && typeof a.name === "string" &&
+            (a.group === "主食" || a.group === "小吃" || a.group === "饮料") &&
+            Number.isFinite(Number(a.price)) &&
+            typeof a.noteTemplate === "string"
+        )
+        .map((a) => ({
+          name: a.name,
+          price: Number(a.price),
+          group: a.group,
+          noteTemplate: a.noteTemplate,
+        }));
+    }
+  }
+  return { categoryGroups, specs, addonsFor };
 }
 
 /* ------------------------------------------------------------------ *
  * 公开菜单页：极简现代风 · 移动优先
  * ------------------------------------------------------------------ */
 
-/** 购物车导出时的主食关键词（含主食成分的汤单独处理） */
-const STAPLE_KEYWORDS = [
-  "饭", "面", "粉", "米线", "饺", "馄饨", "馒头", "包子", "粥", "年糕",
-  "主食", "点心", "炒饭", "粉丝", "糍", "粑", "饼", "羹",
-];
-
-/** 购物车导出时的饮料关键词（单字"水/汁/冰"刻意排除，避免误伤口水鸡、蜜汁叉烧） */
-const DRINK_KEYWORDS = [
-  "饮", "茶", "冰粉", "可乐", "果汁", "奶", "咖啡", "甘露", "酸梅",
-  "豆浆", "豆奶", "汽水", "椰汁",
-];
-
-/**
- * 按菜名把菜品自动归类到主食 / 小吃 / 饮料。
- * 菜单分类不固定（线上与内置数据不同），因此只依据菜名关键词，无法识别则归小吃。
- */
-function classifyFood(name: string): FoodGroup {
-  const s = name.trim();
-
-  // 否定词：面筋 / 面粉 不是主食
-  if (/面筋|面粉/.test(s)) return "小吃";
-
-  // 汤的消歧：成分优先。含主食成分的汤归主食，纯甜汤归饮料，其余带料汤归主食。
-  if (s.includes("汤")) {
-    if (/粉丝|面|饭|米线|饺|馄饨|粉/.test(s)) return "主食";
-    if (/酸梅|绿豆|红豆|银耳|冰糖|甜|冰/.test(s)) return "饮料";
-    return "主食";
-  }
-
-  // 冰粉是甜品饮料，先于"粉"的主食判定拦截
-  if (s.includes("冰粉")) return "饮料";
-  if (STAPLE_KEYWORDS.some((k) => s.includes(k))) return "主食";
-  if (DRINK_KEYWORDS.some((k) => s.includes(k))) return "饮料";
-  return "小吃";
+/** 菜品归类：直接取 KV 配置中其所在分类的映射，未配置则归"小吃" */
+function classifyFood(categoryId: string, config: MenuConfig): FoodGroup {
+  return config.categoryGroups[categoryId] || "小吃";
 }
 
 /** 菜品图片块：有图则懒加载 + 占位符，无图则显示分类 emoji 占位 */
@@ -231,13 +314,29 @@ function renderImageBlock(image: string | undefined, emoji: string): string {
   return `<div class="card-img ph-only"><span>${emoji}</span></div>`;
 }
 
-function renderItemCard(item: MenuItem, emoji: string, key: string): string {
+function renderItemCard(
+  item: MenuItem,
+  emoji: string,
+  key: string,
+  hasSpec: boolean,
+  hasAddons: boolean
+): string {
   const tag = item.tag
     ? `<span class="tag">${escapeHtml(item.tag)}</span>`
     : "";
   const desc = item.desc
     ? `<p class="desc">${escapeHtml(item.desc)}</p>`
     : "";
+  // 带规格或加料的菜：卡片上显示选择按钮与已选总份数，详细选择在弹窗内完成
+  const needDialog = hasSpec || hasAddons;
+  const dialogLabel = hasSpec && hasAddons ? "选规格/加料 ›" : hasSpec ? "选规格 ›" : "选加料 ›";
+  const ctrlInner = needDialog
+    ? `<span class="qty-num">0</span>
+            <button class="add-btn add-particle" type="button">${dialogLabel}</button>`
+    : `<button class="qty-minus" type="button" aria-label="减少">−</button>
+            <span class="qty-num">0</span>
+            <button class="qty-plus add-particle" type="button" aria-label="增加">+</button>
+            <button class="add-btn add-particle" type="button">加入购物车</button>`;
   return `
       <article class="card">
         ${renderImageBlock(item.image, emoji)}
@@ -247,11 +346,8 @@ function renderItemCard(item: MenuItem, emoji: string, key: string): string {
             <span class="price">¥${item.price}</span>
           </div>
           ${desc}
-          <div class="cart-ctrl" data-ctrl-key="${escapeAttr(key)}">
-            <button class="qty-minus" type="button" aria-label="减少">−</button>
-            <span class="qty-num">0</span>
-            <button class="qty-plus add-particle" type="button" aria-label="增加">+</button>
-            <button class="add-btn add-particle" type="button">加入购物车</button>
+          <div class="cart-ctrl${needDialog ? " spec-mode" : ""}" data-ctrl-key="${escapeAttr(key)}">
+            ${ctrlInner}
           </div>
         </div>
       </article>`;
@@ -269,22 +365,38 @@ function renderPage(menu: MenuData): string {
     )
     .join("");
 
-  // 购物车商品目录：归类、名称、价格在服务端一次算好，客户端只按 key 操作。
-  // key 用「分类id__索引」保证稳定；{} 仅作数据容器，不参与渲染。
-  const cartCatalog: Array<{ key: string; name: string; price: number; group: FoodGroup }> = [];
+  // 购物车商品目录：归类、名称、价格、规格、加料全部来自 KV 配置，服务端一次算好内联给客户端。
+  // key 用「分类id__索引」保证稳定。
+  const config: MenuConfig = menu.config || {
+    categoryGroups: inferGroups(menu.categories),
+    specs: {},
+    addonsFor: {},
+  };
+  const cartCatalog: Array<{
+    key: string;
+    name: string;
+    price: number;
+    group: FoodGroup;
+    spec: SpecConfig | null;
+    addons: AddonConfig[];
+  }> = [];
   const sections = menu.categories
     .map((cat) => {
       const emoji = cat.icon || "🍽️";
       const cards = cat.items
         .map((it, idx) => {
           const key = `${cat.id}__${idx}`;
+          const spec = config.specs[it.name.trim()] || null;
+          const addons = config.addonsFor[it.name.trim()] || [];
           cartCatalog.push({
             key,
             name: it.name,
             price: it.price,
-            group: classifyFood(it.name),
+            group: classifyFood(cat.id, config),
+            spec,
+            addons,
           });
-          return renderItemCard(it, emoji, key);
+          return renderItemCard(it, emoji, key, !!spec, addons.length > 0);
         })
         .join("");
       return `
@@ -444,6 +556,10 @@ function renderPage(menu: MenuData): string {
   .cart-ctrl.has-qty .qty-minus, .cart-ctrl.has-qty .qty-plus, .cart-ctrl.has-qty .qty-num { display: inline-flex; }
   .cart-ctrl.has-qty .add-btn { display: none; }
   .cart-ctrl button:active { transform: scale(.9); }
+  /* 规格菜品：数量数字常显（显示已选总份数） */
+  .cart-ctrl.spec-mode .qty-num { display: inline-flex; }
+  .cart-ctrl.spec-mode .qty-num:not(:empty) { color: var(--accent); font-weight: 600; }
+  .cart-ctrl.spec-mode .add-btn { flex: 1; }
 
   /* 底部悬浮购物车按钮 */
   .cart-fab {
@@ -512,6 +628,20 @@ function renderPage(menu: MenuData): string {
     white-space: nowrap;
   }
   .toast.show { opacity: 1; }
+
+  /* 规格选择弹窗 */
+  .spec-group { margin-top: 14px; }
+  .spec-group .spec-label { display: block; font-size: 13px; color: var(--sub); margin-bottom: 8px; }
+  .spec-options { display: flex; flex-wrap: wrap; gap: 8px; }
+  .spec-opt {
+    padding: 7px 14px; border: 1px solid var(--border); border-radius: 999px;
+    background: var(--bg); color: var(--text); font-size: 13px; cursor: pointer;
+    font-family: inherit; transition: background .2s, color .2s, border-color .2s;
+  }
+  .spec-opt.selected { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .spec-opt:active { transform: scale(.95); }
+  .spec-price-line { margin-top: 16px; font-size: 14px; color: var(--sub); }
+  .spec-price-line b { color: var(--accent); font-size: 18px; }
 </style>
 </head>
 <body>
@@ -551,6 +681,36 @@ function renderPage(menu: MenuData): string {
     </div>
   </div>
   <div id="cartToast" class="toast"></div>
+
+  <div class="modal-mask" id="specModal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-label="选择规格">
+      <div class="modal-head">
+        <h3 id="specTitle">选择规格</h3>
+        <button class="modal-close" id="specClose" aria-label="关闭">✕</button>
+      </div>
+      <div class="spec-group">
+        <span class="spec-label">口味</span>
+        <div class="spec-options" id="specFlavors"></div>
+      </div>
+      <div class="spec-group" id="specAddonsWrap" hidden>
+        <span class="spec-label">加料（可多选，单独计价）</span>
+        <div class="spec-options" id="specAddons"></div>
+      </div>
+      <div class="spec-group" id="specPortionsWrap">
+        <span class="spec-label">份量</span>
+        <div class="spec-options" id="specPortions"></div>
+      </div>
+      <div class="spec-price-line">价格：<b id="specPrice">¥0</b></div>
+      <div class="spec-group" id="specCurrentWrap" hidden>
+        <span class="spec-label">已加入</span>
+        <div id="specCurrent"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn-ghost" id="specCancel">取消</button>
+        <button class="btn-primary" id="specConfirm">加入购物车</button>
+      </div>
+    </div>
+  </div>
 
 <script>
   // 深色模式：本地存储 + 跟随系统
@@ -646,12 +806,22 @@ function renderPage(menu: MenuData): string {
       try { localStorage.setItem(CART_KEY, JSON.stringify(cart)); } catch (e) {}
     }
 
-    // 用服务端目录覆盖购物车中的名称/价格/归类，并剔除已下架菜品
+    // 购物车条目 key：无规格=基础 key；有规格=基础 key + "|口味|份量"，二者视为不同条目。
+    // 用第一个 "|" 之前的部分取回基础目录信息，做覆盖与下架清理。
+    function baseKeyOf(entry) {
+      var i = entry.key.indexOf("|");
+      return i === -1 ? entry.key : entry.key.slice(0, i);
+    }
+
+    // 用服务端目录覆盖购物车中的名称/归类，并剔除已下架菜品。
+    // 加料条目与规格条目的名称/价格/归类由其自身配置决定，不受主菜覆盖。
     function reconcile() {
-      cart.entries = cart.entries.filter(function (e) { return !!catalogMap[e.key]; });
+      cart.entries = cart.entries.filter(function (e) { return !!catalogMap[baseKeyOf(e)]; });
       cart.entries.forEach(function (e) {
-        var c = catalogMap[e.key];
-        e.name = c.name; e.price = c.price; e.group = c.group;
+        if (e.key.indexOf("|A|") !== -1) return;       // 加料条目原样保留
+        var c = catalogMap[baseKeyOf(e)];
+        e.name = c.name; e.group = c.group;
+        if (!e.flavor || !e.portion) e.price = c.price;
       });
     }
 
@@ -662,15 +832,28 @@ function renderPage(menu: MenuData): string {
       toast._t = setTimeout(function () { toastEl.classList.remove("show"); }, 1800);
     }
 
+    function entryLabel(e) {
+      // 规格菜品：鸡块/鸡柳（托盘装）[孜然·中份]×2；普通菜品：蛋炒饭×2
+      var spec = [e.flavor, e.portion].filter(Boolean);
+      var suffix = spec.length ? "[" + spec.join("·") + "]" : "";
+      return e.name + suffix + "×" + e.qty;
+    }
+
     function buildExportText() {
       var groups = { "主食": [], "小吃": [], "饮料": [] };
+      var autoNotes = [];
       cart.entries.forEach(function (e) {
-        groups[e.group].push(e.name + "×" + e.qty);
+        groups[e.group].push(entryLabel(e));
+        if (e.autoNote) autoNotes.push(e.autoNote);
       });
       var lines = ["主食", "小吃", "饮料"].map(function (g) {
         return g + "：（" + groups[g].join("、") + "）";
       });
-      lines.push("备注：（" + (cart.note || "") + "）");
+      // 备注：手填备注 + 由加料模板自动生成的备注
+      var notes = [];
+      if (cart.note) notes.push(cart.note);
+      if (autoNotes.length) notes.push(autoNotes.join("；"));
+      lines.push("备注：（" + notes.join("；") + "）");
       return lines.join("\\n");
     }
 
@@ -685,20 +868,35 @@ function renderPage(menu: MenuData): string {
       for (var i = 0; i < ctrls.length; i++) {
         var ctrl = ctrls[i];
         var key = ctrl.getAttribute("data-ctrl-key");
+        var isSpec = ctrl.classList.contains("spec-mode");
         var qty = 0;
         for (var j = 0; j < cart.entries.length; j++) {
-          if (cart.entries[j].key === key) { qty = cart.entries[j].qty; break; }
+          var e = cart.entries[j];
+          // 规格卡片汇总该菜品所有规格条目的数量；普通卡片只匹配精确 key
+          var match = isSpec ? e.key.indexOf(key + "|") === 0 : e.key === key;
+          if (match) qty += e.qty;
         }
-        ctrl.querySelector(".qty-num").textContent = qty;
+        var numEl = ctrl.querySelector(".qty-num");
+        if (numEl) numEl.textContent = qty ? (isSpec ? qty + "份" : qty) : "";
         ctrl.classList.toggle("has-qty", qty > 0);
       }
       if (!modal.hidden) exportText.value = buildExportText();
     }
 
-    function changeQty(item, delta) {
+    // opts: { flavor, portion, price, addonName, group, autoNote }
+    // 加料作为独立条目入车（带自己的 group 与 autoNote），key 用 |A| 区分加料条目。
+    function changeQty(item, delta, opts) {
+      opts = opts || {};
+      var key = item.key;
+      if (opts.addonName) {
+        key += "|A|" + opts.addonName;
+      } else {
+        var spec = [opts.flavor, opts.portion].filter(Boolean);
+        if (spec.length) key += "|" + spec.join("|");
+      }
       var found = null, idx = -1;
       for (var i = 0; i < cart.entries.length; i++) {
-        if (cart.entries[i].key === item.key) { found = cart.entries[i]; idx = i; break; }
+        if (cart.entries[i].key === key) { found = cart.entries[i]; idx = i; break; }
       }
       if (found) {
         found.qty += delta;
@@ -706,8 +904,13 @@ function renderPage(menu: MenuData): string {
         else if (found.qty > 99) found.qty = 99;
       } else if (delta > 0) {
         cart.entries.push({
-          key: item.key, name: item.name, price: item.price,
-          group: item.group, qty: Math.min(delta, 99)
+          key: key,
+          name: opts.addonName || item.name,
+          price: opts.price != null ? opts.price : item.price,
+          group: opts.group || item.group,
+          qty: Math.min(delta, 99),
+          flavor: opts.flavor || "", portion: opts.portion || "",
+          autoNote: opts.autoNote || ""
         });
       }
       saveCart();
@@ -756,6 +959,11 @@ function renderPage(menu: MenuData): string {
       if (!ctrl) return;
       var item = catalogMap[ctrl.getAttribute("data-ctrl-key")];
       if (!item) return;
+      if (item.spec || (item.addons && item.addons.length)) {
+        // 带规格或加料：打开选择弹窗，在弹窗内选口味/份量/加料
+        openSpec(item);
+        return;
+      }
       if (btn.classList.contains("qty-minus")) {
         changeQty(item, -1);
       } else if (btn.classList.contains("add-btn") || btn.classList.contains("qty-plus")) {
@@ -764,6 +972,172 @@ function renderPage(menu: MenuData): string {
         changeQty(item, 1);
         flyToCart(sx, sy);
       }
+    });
+
+    // 规格/加料选择弹窗：口味 + 份量 + 加料（多选，独立入车并生成备注）
+    var specModal = document.getElementById("specModal");
+    var specFlavors = document.getElementById("specFlavors");
+    var specPortionsWrap = document.getElementById("specPortionsWrap");
+    var specPortions = document.getElementById("specPortions");
+    var specAddonsWrap = document.getElementById("specAddonsWrap");
+    var specAddons = document.getElementById("specAddons");
+    var specPrice = document.getElementById("specPrice");
+    var specCurrentWrap = document.getElementById("specCurrentWrap");
+    var specCurrent = document.getElementById("specCurrent");
+    var specItem = null;
+    var selFlavor = "", selPortion = "";
+    var selAddons = [];   // 选中的加料名数组
+
+    function updateSpecPrice() {
+      var p = 0;
+      if (specItem.spec) {
+        (specItem.spec.portions || []).forEach(function (x) {
+          if (x.name === selPortion) p = x.price;
+        });
+      } else {
+        p = specItem.price;
+      }
+      selAddons.forEach(function (n) {
+        var a = (specItem.addons || []).filter(function (x) { return x.name === n; })[0];
+        if (a) p += a.price;
+      });
+      specPrice.textContent = "¥" + p;
+    }
+    function entryDisplay(e) {
+      if (e.key.indexOf("|A|") !== -1) return e.name + "（加料）";
+      return [e.flavor, e.portion].filter(Boolean).join("·");
+    }
+    function renderSpecCurrent() {
+      var list = cart.entries.filter(function (e) {
+        return e.key.indexOf(specItem.key + "|") === 0;
+      });
+      if (!list.length) { specCurrentWrap.hidden = true; return; }
+      specCurrentWrap.hidden = false;
+      specCurrent.innerHTML = "";
+      list.forEach(function (e) {
+        var row = document.createElement("div");
+        row.className = "cart-ctrl has-qty";
+        row.style.maxWidth = "260px";
+        var minus = document.createElement("button");
+        minus.className = "qty-minus spec-curr-minus";
+        minus.type = "button"; minus.textContent = "−";
+        var num = document.createElement("span");
+        num.className = "qty-num"; num.textContent = e.qty;
+        var plus = document.createElement("button");
+        plus.className = "qty-plus spec-curr-plus";
+        plus.type = "button"; plus.textContent = "+";
+        var label = document.createElement("span");
+        label.style.cssText = "flex:1;font-size:13px";
+        label.textContent = entryDisplay(e) + "  ¥" + e.price;
+        minus.setAttribute("data-k", e.key);
+        plus.setAttribute("data-k", e.key);
+        row.appendChild(label); row.appendChild(minus); row.appendChild(num); row.appendChild(plus);
+        specCurrent.appendChild(row);
+      });
+    }
+    function renderSpecOptions() {
+      // 口味
+      specFlavors.innerHTML = "";
+      if (specItem.spec) {
+        (specItem.spec.flavors || []).forEach(function (f) {
+          var b = document.createElement("button");
+          b.type = "button"; b.className = "spec-opt" + (f === selFlavor ? " selected" : "");
+          b.textContent = f;
+          b.addEventListener("click", function () { selFlavor = f; renderSpecOptions(); });
+          specFlavors.appendChild(b);
+        });
+      }
+      // 份量
+      specPortionsWrap.hidden = !specItem.spec;
+      specPortions.innerHTML = "";
+      if (specItem.spec) {
+        (specItem.spec.portions || []).forEach(function (p) {
+          var b = document.createElement("button");
+          b.type = "button"; b.className = "spec-opt" + (p.name === selPortion ? " selected" : "");
+          b.textContent = p.name + " ¥" + p.price;
+          b.addEventListener("click", function () { selPortion = p.name; renderSpecOptions(); updateSpecPrice(); });
+          specPortions.appendChild(b);
+        });
+      }
+      // 加料（多选）
+      specAddonsWrap.hidden = !(specItem.addons && specItem.addons.length);
+      specAddons.innerHTML = "";
+      (specItem.addons || []).forEach(function (a) {
+        var on = selAddons.indexOf(a.name) !== -1;
+        var b = document.createElement("button");
+        b.type = "button"; b.className = "spec-opt" + (on ? " selected" : "");
+        b.textContent = a.name + " +¥" + a.price;
+        b.addEventListener("click", function () {
+          var i = selAddons.indexOf(a.name);
+          if (i === -1) selAddons.push(a.name); else selAddons.splice(i, 1);
+          renderSpecOptions(); updateSpecPrice();
+        });
+        specAddons.appendChild(b);
+      });
+    }
+    function openSpec(item) {
+      specItem = item;
+      selFlavor = item.spec ? (item.spec.flavors[0] || "") : "";
+      selPortion = item.spec ? ((item.spec.portions[0] || {}).name || "") : "";
+      selAddons = [];
+      document.getElementById("specTitle").textContent = item.name;
+      document.getElementById("specConfirm").textContent =
+        item.spec ? "加入购物车" : "加入购物车";
+      renderSpecOptions();
+      updateSpecPrice();
+      renderSpecCurrent();
+      specModal.hidden = false;
+    }
+    function currentPortionPrice() {
+      var p = specItem.price;
+      if (specItem.spec) {
+        (specItem.spec.portions || []).forEach(function (x) { if (x.name === selPortion) p = x.price; });
+      }
+      return p;
+    }
+    function addSpec() {
+      if (specItem.spec && (!selFlavor || !selPortion)) { toast("请选择口味和份量"); return; }
+      // 主菜入车
+      changeQty(specItem, 1, {
+        flavor: selFlavor, portion: selPortion, price: currentPortionPrice()
+      });
+      // 加料分别作为独立条目入车，按模板生成备注
+      selAddons.forEach(function (n) {
+        var a = (specItem.addons || []).filter(function (x) { return x.name === n; })[0];
+        if (!a) return;
+        var note = (a.noteTemplate || "")
+          .replace(/\{addon\}/g, a.name)
+          .replace(/\{base\}/g, specItem.name);
+        changeQty(specItem, 1, {
+          addonName: a.name, price: a.price, group: a.group, autoNote: note
+        });
+      });
+      renderSpecCurrent();
+      var r = document.getElementById("specConfirm").getBoundingClientRect();
+      flyToCart(r.left + r.width / 2, r.top + r.height / 2);
+      toast("已加入购物车");
+    }
+    document.getElementById("specConfirm").addEventListener("click", addSpec);
+    document.getElementById("specCancel").addEventListener("click", function () { specModal.hidden = true; });
+    document.getElementById("specClose").addEventListener("click", function () { specModal.hidden = true; });
+    specModal.addEventListener("click", function (ev) { if (ev.target === this) this.hidden = true; });
+    // 已加入条目的增减
+    specCurrent.addEventListener("click", function (ev) {
+      var b = ev.target.closest("button");
+      if (!b) return;
+      var key = b.getAttribute("data-k");
+      var e = null;
+      for (var i = 0; i < cart.entries.length; i++) { if (cart.entries[i].key === key) { e = cart.entries[i]; break; } }
+      if (!e) return;
+      var isAddon = e.key.indexOf("|A|") !== -1;
+      var opts;
+      if (isAddon) {
+        opts = { addonName: e.name.replace(/（加料）$/, ""), price: e.price, group: e.group, autoNote: e.autoNote };
+      } else {
+        opts = { flavor: e.flavor, portion: e.portion, price: e.price };
+      }
+      changeQty(specItem, b.classList.contains("spec-curr-plus") ? 1 : -1, opts);
+      renderSpecCurrent();
     });
 
     // 悬浮按钮 / 模态框
@@ -897,6 +1271,21 @@ function renderAdminPage(): string {
   }
   #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
   #toast.err { background: var(--accent); }
+
+  /* 图片预览弹窗 */
+  .thumb, .dz-img { cursor: zoom-in; }
+  .preview-mask {
+    position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 100;
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+  }
+  .preview-mask[hidden] { display: none; }
+  .preview-box { position: relative; max-width: 92vw; max-height: 88vh; }
+  .preview-box img { max-width: 92vw; max-height: 88vh; border-radius: 12px; box-shadow: 0 8px 40px rgba(0,0,0,.5); display: block; }
+  .preview-close {
+    position: absolute; top: -14px; right: -14px; width: 36px; height: 36px; border-radius: 50%;
+    background: #fff; color: #1f2329; border: none; font-size: 20px; line-height: 1;
+    cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,.3); display: flex; align-items: center; justify-content: center;
+  }
 </style>
 </head>
 <body>
@@ -944,7 +1333,14 @@ function renderAdminPage(): string {
   </div>
 </div>
 
-<div id="toast"></div>
+  <div id="toast"></div>
+
+  <div class="preview-mask" id="previewMask" hidden>
+    <div class="preview-box">
+      <button class="preview-close" id="previewClose" aria-label="关闭预览">✕</button>
+      <img id="previewImg" alt="" />
+    </div>
+  </div>
 
 <script>
 var state = null;
@@ -1010,7 +1406,21 @@ function resetDraft() {
   $("dzImg").src = "";
   $("dzPh").style.display = "block";
 }
-dz.addEventListener("click", function () { $("dzFile").click(); });
+/* 图片点击预览 */
+function openPreview(src) {
+  if (!src) return;
+  $("previewImg").src = src;
+  $("previewMask").hidden = false;
+}
+$("previewClose").addEventListener("click", function () { $("previewMask").hidden = true; });
+$("previewMask").addEventListener("click", function (ev) { if (ev.target === this) this.hidden = true; });
+document.addEventListener("keydown", function (ev) { if (ev.key === "Escape") $("previewMask").hidden = true; });
+
+dz.addEventListener("click", function (e) {
+  // 点击已上传的缩略图时预览大图，不触发文件选择
+  if (e.target === $("dzImg")) { openPreview($("dzImg").src); return; }
+  $("dzFile").click();
+});
 dz.addEventListener("dragover", function (e) { e.preventDefault(); dz.classList.add("dragover"); });
 dz.addEventListener("dragleave", function () { dz.classList.remove("dragover"); });
 dz.addEventListener("drop", function (e) {
@@ -1071,7 +1481,7 @@ function renderCategories() {
       var row = document.createElement("div");
       row.className = "item-row";
       var thumb = it.image
-        ? '<img class="thumb" src="' + esc(it.image) + '" alt="" />'
+        ? '<img class="thumb preview-thumb" src="' + esc(it.image) + '" alt="" title="点击预览" />'
         : '<div class="thumb empty">' + esc(cat.icon || "🍽️") + '</div>';
       row.innerHTML =
         thumb +
@@ -1080,6 +1490,8 @@ function renderCategories() {
         '<input class="i-desc" type="text" value="' + esc(it.desc || "") + '" placeholder="描述" />' +
         '<input class="i-tag" type="text" value="' + esc(it.tag || "") + '" placeholder="标签" />' +
         '<button class="ghost small del-item">删除</button>';
+      var pt = row.querySelector(".preview-thumb");
+      if (pt) pt.addEventListener("click", function () { openPreview(state.categories[ci].items[ii].image); });
       row.querySelector(".i-name").addEventListener("input", function (e) { state.categories[ci].items[ii].name = e.target.value; });
       row.querySelector(".i-price").addEventListener("input", function (e) { state.categories[ci].items[ii].price = Number(e.target.value) || 0; });
       row.querySelector(".i-desc").addEventListener("input", function (e) { state.categories[ci].items[ii].desc = e.target.value; });
