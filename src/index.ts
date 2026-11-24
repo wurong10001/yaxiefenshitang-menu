@@ -23,6 +23,24 @@ export interface MenuData {
   categories: MenuCategory[];
 }
 
+/** 购物车导出时的归类维度 */
+type FoodGroup = "主食" | "小吃" | "饮料";
+
+/** 购物车单条记录：key 对应 cartCatalog 中的稳定键 */
+interface CartEntry {
+  key: string;
+  name: string;
+  price: number;
+  group: FoodGroup;
+  qty: number;
+}
+
+/** 购物车完整状态，整体序列化进 localStorage */
+interface CartState {
+  entries: CartEntry[];
+  note: string;
+}
+
 export interface Env {
   MENU_KV: KVNamespace;
   MENU_ADMIN_TOKEN?: string;
@@ -165,6 +183,42 @@ function normalizeMenu(raw: unknown): MenuData | null {
  * 公开菜单页：极简现代风 · 移动优先
  * ------------------------------------------------------------------ */
 
+/** 购物车导出时的主食关键词（含主食成分的汤单独处理） */
+const STAPLE_KEYWORDS = [
+  "饭", "面", "粉", "米线", "饺", "馄饨", "馒头", "包子", "粥", "年糕",
+  "主食", "点心", "炒饭", "粉丝", "糍", "粑", "饼", "羹",
+];
+
+/** 购物车导出时的饮料关键词（单字"水/汁/冰"刻意排除，避免误伤口水鸡、蜜汁叉烧） */
+const DRINK_KEYWORDS = [
+  "饮", "茶", "冰粉", "可乐", "果汁", "奶", "咖啡", "甘露", "酸梅",
+  "豆浆", "豆奶", "汽水", "椰汁",
+];
+
+/**
+ * 按菜名把菜品自动归类到主食 / 小吃 / 饮料。
+ * 菜单分类不固定（线上与内置数据不同），因此只依据菜名关键词，无法识别则归小吃。
+ */
+function classifyFood(name: string): FoodGroup {
+  const s = name.trim();
+
+  // 否定词：面筋 / 面粉 不是主食
+  if (/面筋|面粉/.test(s)) return "小吃";
+
+  // 汤的消歧：成分优先。含主食成分的汤归主食，纯甜汤归饮料，其余带料汤归主食。
+  if (s.includes("汤")) {
+    if (/粉丝|面|饭|米线|饺|馄饨|粉/.test(s)) return "主食";
+    if (/酸梅|绿豆|红豆|银耳|冰糖|甜|冰/.test(s)) return "饮料";
+    return "主食";
+  }
+
+  // 冰粉是甜品饮料，先于"粉"的主食判定拦截
+  if (s.includes("冰粉")) return "饮料";
+  if (STAPLE_KEYWORDS.some((k) => s.includes(k))) return "主食";
+  if (DRINK_KEYWORDS.some((k) => s.includes(k))) return "饮料";
+  return "小吃";
+}
+
 /** 菜品图片块：有图则懒加载 + 占位符，无图则显示分类 emoji 占位 */
 function renderImageBlock(image: string | undefined, emoji: string): string {
   if (image) {
@@ -177,7 +231,7 @@ function renderImageBlock(image: string | undefined, emoji: string): string {
   return `<div class="card-img ph-only"><span>${emoji}</span></div>`;
 }
 
-function renderItemCard(item: MenuItem, emoji: string): string {
+function renderItemCard(item: MenuItem, emoji: string, key: string): string {
   const tag = item.tag
     ? `<span class="tag">${escapeHtml(item.tag)}</span>`
     : "";
@@ -193,6 +247,12 @@ function renderItemCard(item: MenuItem, emoji: string): string {
             <span class="price">¥${item.price}</span>
           </div>
           ${desc}
+          <div class="cart-ctrl" data-ctrl-key="${escapeAttr(key)}">
+            <button class="qty-minus" type="button" aria-label="减少">−</button>
+            <span class="qty-num">0</span>
+            <button class="qty-plus add-particle" type="button" aria-label="增加">+</button>
+            <button class="add-btn add-particle" type="button">加入购物车</button>
+          </div>
         </div>
       </article>`;
 }
@@ -209,10 +269,24 @@ function renderPage(menu: MenuData): string {
     )
     .join("");
 
+  // 购物车商品目录：归类、名称、价格在服务端一次算好，客户端只按 key 操作。
+  // key 用「分类id__索引」保证稳定；{} 仅作数据容器，不参与渲染。
+  const cartCatalog: Array<{ key: string; name: string; price: number; group: FoodGroup }> = [];
   const sections = menu.categories
     .map((cat) => {
       const emoji = cat.icon || "🍽️";
-      const cards = cat.items.map((it) => renderItemCard(it, emoji)).join("");
+      const cards = cat.items
+        .map((it, idx) => {
+          const key = `${cat.id}__${idx}`;
+          cartCatalog.push({
+            key,
+            name: it.name,
+            price: it.price,
+            group: classifyFood(it.name),
+          });
+          return renderItemCard(it, emoji, key);
+        })
+        .join("");
       return `
       <section class="cat-section" id="cat-${escapeAttr(cat.id)}">
         <h3 class="cat-title">${emoji ? `<span class="cat-icon">${emoji}</span>` : ""}<span>${escapeHtml(
@@ -222,6 +296,12 @@ function renderPage(menu: MenuData): string {
       </section>`;
     })
     .join("");
+
+  // 内联为 JS 字面量，转义尖括号与 & 防止 </script> 截断及 XSS
+  const catalogJson = JSON.stringify(cartCatalog)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026");
 
   return `<!doctype html>
 <html lang="zh-CN" data-theme="light">
@@ -345,6 +425,93 @@ function renderPage(menu: MenuData): string {
   @media (min-width: 700px) {
     .grid { grid-template-columns: 1fr 1fr; }
   }
+
+  /* 购物车：卡片内数量控件 */
+  .cart-ctrl { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+  .cart-ctrl .qty-minus, .cart-ctrl .qty-plus {
+    width: 26px; height: 26px; flex: none; border: 1px solid var(--border); border-radius: 8px;
+    background: transparent; color: var(--text); font-size: 16px; line-height: 1;
+    cursor: pointer; display: none; align-items: center; justify-content: center;
+    font-family: inherit; transition: transform .15s, background .2s;
+  }
+  .cart-ctrl .qty-plus { border-radius: 50%; background: var(--accent); color: #fff; border-color: var(--accent); }
+  .cart-ctrl .qty-num { min-width: 18px; text-align: center; font-size: 13px; display: none; }
+  .cart-ctrl .add-btn {
+    flex: 1; padding: 7px 10px; border: 1px solid var(--accent); border-radius: 8px;
+    background: var(--accent-soft); color: var(--accent); font-size: 13px;
+    cursor: pointer; font-family: inherit; transition: transform .15s;
+  }
+  .cart-ctrl.has-qty .qty-minus, .cart-ctrl.has-qty .qty-plus, .cart-ctrl.has-qty .qty-num { display: inline-flex; }
+  .cart-ctrl.has-qty .add-btn { display: none; }
+  .cart-ctrl button:active { transform: scale(.9); }
+
+  /* 底部悬浮购物车按钮 */
+  .cart-fab {
+    position: fixed; right: 16px; bottom: 18px; z-index: 40;
+    display: flex; align-items: center; gap: 8px;
+    padding: 11px 16px; border: none; border-radius: 999px;
+    background: var(--accent); color: #fff; font-size: 14px; font-weight: 600;
+    box-shadow: 0 6px 18px rgba(0,0,0,.22); cursor: pointer; font-family: inherit;
+    transition: transform .2s;
+  }
+  .cart-fab .badge {
+    background: #fff; color: var(--accent); border-radius: 999px;
+    padding: 0 7px; font-size: 12px; min-width: 20px; text-align: center;
+  }
+  .cart-fab[hidden] { display: none; }
+  .cart-fab.bump { animation: fab-bump .35s ease; }
+  @keyframes fab-bump { 0% { transform: scale(1); } 40% { transform: scale(1.18); } 100% { transform: scale(1); } }
+  @media (max-width: 767px) {
+    .cart-fab { right: 50%; transform: translateX(50%); bottom: 14px; }
+    .cart-fab.bump { animation: fab-bump-m .35s ease; }
+    @keyframes fab-bump-m { 0% { transform: translateX(50%) scale(1); } 40% { transform: translateX(50%) scale(1.18); } 100% { transform: translateX(50%) scale(1); } }
+  }
+
+  /* 飞向购物车的粒子圆 */
+  .fly-dot {
+    position: fixed; left: 0; top: 0; z-index: 70; width: 16px; height: 16px; border-radius: 50%;
+    background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft), 0 3px 8px rgba(0,0,0,.25);
+    pointer-events: none; display: flex; align-items: center; justify-content: center;
+    color: #fff; font-size: 10px; will-change: transform;
+  }
+
+  /* 导出模态框 */
+  .modal-mask {
+    position: fixed; inset: 0; background: rgba(0,0,0,.46); z-index: 60;
+    display: flex; align-items: center; justify-content: center; padding: 16px;
+  }
+  .modal-mask[hidden] { display: none; }
+  .modal {
+    width: 100%; max-width: 460px; max-height: 86vh; overflow-y: auto;
+    background: var(--card); color: var(--text); border: 1px solid var(--border);
+    border-radius: 14px; padding: 18px; box-shadow: var(--shadow);
+  }
+  .modal-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .modal-head h3 { margin: 0; font-size: 17px; }
+  .modal-close { border: none; background: transparent; color: var(--sub); font-size: 18px; cursor: pointer; }
+  .export-text, .note-input {
+    width: 100%; box-sizing: border-box; border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px; font-size: 13px; font-family: inherit;
+    background: var(--bg); color: var(--text); resize: vertical; line-height: 1.7;
+  }
+  .export-text { min-height: 140px; }
+  .note-input { min-height: 56px; }
+  .note-label { display: block; margin-top: 14px; font-size: 13px; color: var(--sub); }
+  .modal-actions { display: flex; gap: 10px; margin-top: 16px; }
+  .btn-ghost, .btn-primary {
+    flex: 1; padding: 10px; border-radius: 10px; font-size: 14px;
+    cursor: pointer; font-family: inherit; transition: transform .15s;
+  }
+  .btn-ghost { background: var(--bg); color: var(--sub); border: 1px solid var(--border); }
+  .btn-primary { background: var(--accent); color: #fff; border: none; }
+  .btn-ghost:active, .btn-primary:active { transform: scale(.96); }
+  .toast {
+    position: fixed; left: 50%; bottom: 86px; transform: translateX(-50%);
+    background: rgba(31,35,41,.94); color: #fff; padding: 10px 18px; border-radius: 10px;
+    font-size: 13px; z-index: 80; opacity: 0; pointer-events: none; transition: opacity .3s;
+    white-space: nowrap;
+  }
+  .toast.show { opacity: 1; }
 </style>
 </head>
 <body>
@@ -361,6 +528,29 @@ function renderPage(menu: MenuData): string {
   </div>
 
   <p class="footer">菜单数据由 Cloudflare KV 实时驱动 · <a href="/menu" style="color:var(--accent)">管理数据</a></p>
+
+  <button class="cart-fab" id="cartFab" hidden aria-label="查看购物车">
+    <span>🛒 购物车</span>
+    <span class="badge" id="cartCount">0</span>
+    <span id="cartTotal">¥0</span>
+  </button>
+
+  <div class="modal-mask" id="cartModal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-label="购物车">
+      <div class="modal-head">
+        <h3>我的订单</h3>
+        <button class="modal-close" id="modalClose" aria-label="关闭">✕</button>
+      </div>
+      <textarea id="exportText" class="export-text" readonly aria-label="订单文本"></textarea>
+      <label class="note-label" for="cartNote">备注</label>
+      <textarea id="cartNote" class="note-input" placeholder="如：不要辣、少放盐"></textarea>
+      <div class="modal-actions">
+        <button class="btn-ghost" id="clearCart">清空</button>
+        <button class="btn-primary" id="copyOrder">一键复制</button>
+      </div>
+    </div>
+  </div>
+  <div id="cartToast" class="toast"></div>
 
 <script>
   // 深色模式：本地存储 + 跟随系统
@@ -414,6 +604,213 @@ function renderPage(menu: MenuData): string {
       );
       sections.forEach(function (s) { observer.observe(s); });
     }
+  })();
+
+  // 购物车：点菜入车 · 本地持久化 · 自动归类导出 · 一键复制 · 飞入动画
+  (function () {
+    var CART_KEY = "menu-cart";
+    var catalog = ${catalogJson};
+    var catalogMap = {};
+    catalog.forEach(function (c) { catalogMap[c.key] = c; });
+
+    var fab = document.getElementById("cartFab");
+    var modal = document.getElementById("cartModal");
+    var exportText = document.getElementById("exportText");
+    var noteInput = document.getElementById("cartNote");
+    var toastEl = document.getElementById("cartToast");
+
+    function loadCart() {
+      var raw = null;
+      try { raw = localStorage.getItem(CART_KEY); } catch (e) {}
+      if (!raw) return { entries: [], note: "" };
+      try {
+        var s = JSON.parse(raw);
+        if (!s || !Array.isArray(s.entries)) return { entries: [], note: "" };
+        s.entries = s.entries.filter(function (e) {
+          return e && typeof e.key === "string" && typeof e.name === "string"
+            && isFinite(e.price) && e.price >= 0
+            && isFinite(e.qty) && e.qty > 0
+            && (e.group === "主食" || e.group === "小吃" || e.group === "饮料");
+        }).map(function (e) {
+          e.qty = Math.min(Math.floor(e.qty), 99);
+          return e;
+        });
+        s.note = typeof s.note === "string" ? s.note : "";
+        return s;
+      } catch (e) { return { entries: [], note: "" }; }
+    }
+
+    var cart = loadCart();
+
+    function saveCart() {
+      try { localStorage.setItem(CART_KEY, JSON.stringify(cart)); } catch (e) {}
+    }
+
+    // 用服务端目录覆盖购物车中的名称/价格/归类，并剔除已下架菜品
+    function reconcile() {
+      cart.entries = cart.entries.filter(function (e) { return !!catalogMap[e.key]; });
+      cart.entries.forEach(function (e) {
+        var c = catalogMap[e.key];
+        e.name = c.name; e.price = c.price; e.group = c.group;
+      });
+    }
+
+    function toast(msg) {
+      toastEl.textContent = msg;
+      toastEl.classList.add("show");
+      clearTimeout(toast._t);
+      toast._t = setTimeout(function () { toastEl.classList.remove("show"); }, 1800);
+    }
+
+    function buildExportText() {
+      var groups = { "主食": [], "小吃": [], "饮料": [] };
+      cart.entries.forEach(function (e) {
+        groups[e.group].push(e.name + "×" + e.qty);
+      });
+      var lines = ["主食", "小吃", "饮料"].map(function (g) {
+        return g + "：（" + groups[g].join("、") + "）";
+      });
+      lines.push("备注：（" + (cart.note || "") + "）");
+      return lines.join("\\n");
+    }
+
+    function syncUI() {
+      var totalQty = 0, totalPrice = 0;
+      cart.entries.forEach(function (e) { totalQty += e.qty; totalPrice += e.qty * e.price; });
+      document.getElementById("cartCount").textContent = totalQty;
+      document.getElementById("cartTotal").textContent = "¥" + totalPrice;
+      fab.hidden = totalQty === 0;
+
+      var ctrls = document.querySelectorAll("[data-ctrl-key]");
+      for (var i = 0; i < ctrls.length; i++) {
+        var ctrl = ctrls[i];
+        var key = ctrl.getAttribute("data-ctrl-key");
+        var qty = 0;
+        for (var j = 0; j < cart.entries.length; j++) {
+          if (cart.entries[j].key === key) { qty = cart.entries[j].qty; break; }
+        }
+        ctrl.querySelector(".qty-num").textContent = qty;
+        ctrl.classList.toggle("has-qty", qty > 0);
+      }
+      if (!modal.hidden) exportText.value = buildExportText();
+    }
+
+    function changeQty(item, delta) {
+      var found = null, idx = -1;
+      for (var i = 0; i < cart.entries.length; i++) {
+        if (cart.entries[i].key === item.key) { found = cart.entries[i]; idx = i; break; }
+      }
+      if (found) {
+        found.qty += delta;
+        if (found.qty <= 0) cart.entries.splice(idx, 1);
+        else if (found.qty > 99) found.qty = 99;
+      } else if (delta > 0) {
+        cart.entries.push({
+          key: item.key, name: item.name, price: item.price,
+          group: item.group, qty: Math.min(delta, 99)
+        });
+      }
+      saveCart();
+      syncUI();
+    }
+
+    // 飞入动画：从按钮生成一个圆，受重力 + 对购物车的吸引力，到达后消失并让购物车跳动
+    function flyToCart(x, y) {
+      var fr = fab.getBoundingClientRect();
+      if (!fr.width) return;
+      var tx = fr.left + fr.width / 2, ty = fr.top + fr.height / 2;
+      var dot = document.createElement("div");
+      dot.className = "fly-dot";
+      document.body.appendChild(dot);
+
+      var vx = (Math.random() - 0.5) * 2;
+      var vy = -8;                 // 初始向上弹出
+      var k = 0.02, damp = 0.9, gravity = 0.15;
+      var frames = 0;
+
+      function step() {
+        vx += (tx - x) * k;
+        vy += (ty - y) * k + gravity;   // 重力 + 对购物车的吸引力（弹簧式）
+        vx *= damp; vy *= damp;
+        x += vx; y += vy;
+        dot.style.transform = "translate(" + (x - 8) + "px," + (y - 8) + "px)";
+        frames++;
+        var dist = Math.sqrt((tx - x) * (tx - x) + (ty - y) * (ty - y));
+        if (dist < 16 || frames > 100) {
+          if (dot.parentNode) dot.parentNode.removeChild(dot);
+          fab.classList.remove("bump");
+          void fab.offsetWidth;            // 重置动画
+          fab.classList.add("bump");
+          return;
+        }
+        requestAnimationFrame(step);
+      }
+      requestAnimationFrame(step);
+    }
+
+    // 事件委托：卡片按钮
+    document.getElementById("content").addEventListener("click", function (ev) {
+      var btn = ev.target.closest("button");
+      if (!btn) return;
+      var ctrl = btn.closest("[data-ctrl-key]");
+      if (!ctrl) return;
+      var item = catalogMap[ctrl.getAttribute("data-ctrl-key")];
+      if (!item) return;
+      if (btn.classList.contains("qty-minus")) {
+        changeQty(item, -1);
+      } else if (btn.classList.contains("add-btn") || btn.classList.contains("qty-plus")) {
+        var r = btn.getBoundingClientRect();
+        var sx = r.left + r.width / 2, sy = r.top + r.height / 2;
+        changeQty(item, 1);
+        flyToCart(sx, sy);
+      }
+    });
+
+    // 悬浮按钮 / 模态框
+    fab.addEventListener("click", function () {
+      exportText.value = buildExportText();
+      noteInput.value = cart.note;
+      modal.hidden = false;
+    });
+    document.getElementById("modalClose").addEventListener("click", function () { modal.hidden = true; });
+    modal.addEventListener("click", function (ev) { if (ev.target === this) this.hidden = true; });
+
+    // 备注实时持久化并刷新导出文本
+    noteInput.addEventListener("input", function () {
+      cart.note = this.value; saveCart();
+      exportText.value = buildExportText();
+    });
+
+    // 清空
+    document.getElementById("clearCart").addEventListener("click", function () {
+      if (!window.confirm("确定清空购物车？")) return;
+      cart.entries = []; saveCart(); syncUI();
+      toast("购物车已清空");
+    });
+
+    // 一键复制（clipboard + execCommand 降级）
+    function copyText(text) {
+      function fallback() {
+        exportText.value = text;
+        exportText.focus(); exportText.select();
+        try { exportText.setSelectionRange(0, exportText.value.length); } catch (e) {}
+        var ok = false;
+        try { ok = document.execCommand("copy"); } catch (e) {}
+        toast(ok ? "已复制订单，可直接粘贴发送" : "复制失败，请长按文本框手动复制");
+      }
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(function () {
+          toast("已复制订单，可直接粘贴发送");
+        }).catch(fallback);
+      } else {
+        fallback();
+      }
+    }
+    document.getElementById("copyOrder").addEventListener("click", function () {
+      copyText(buildExportText());
+    });
+
+    reconcile(); saveCart(); syncUI();
   })();
 </script>
 </body>
